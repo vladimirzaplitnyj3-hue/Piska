@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RETSING BOT - Полная версия с исправлениями
+RETSING BOT - Полная версия
 Версия: 5.0 Pro
 """
 
@@ -45,7 +45,6 @@ try:
         InlineKeyboardMarkup,
         InlineKeyboardButton
     )
-    from aiogram.utils.exceptions import BotBlocked, ChatNotFound
 except ImportError:
     print("❌ Установите: pip install aiogram")
     sys.exit(1)
@@ -591,7 +590,9 @@ async def process_contact(message: types.Message, state: FSMContext):
         await message.answer(f"❌ *Ошибка:* {str(e)[:100]}", parse_mode='markdown')
         await state.finish()
 
-@dp.message_handler(state=BotStates.waiting_async def process_code(message: types.Message, state: FSMContext):
+# ВАЖНО: Этот декоратор должен быть именно такой!
+@dp.message_handler(state=BotStates.waiting_for_code)
+async def process_code(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
     if message.text == "❌ Отмена":
@@ -1150,7 +1151,8 @@ async def periodic_save():
         except Exception as e:
             logger.error(f"Ошибка периодического сохранения: {e}")
 
-async def monitor_active_campaigns():    """Мониторинг активных кампаний"""
+async def monitor_active_campaigns():
+    """Мониторинг активных кампаний"""
     while True:
         await asyncio.sleep(30)  # Проверяем каждые 30 секунд
         
