@@ -218,6 +218,7 @@ class DataManager:
     def __init__(self):
         self.users: Dict[int, UserData] = {}
         self.active_tasks: Dict[int, asyncio.Task] = {}
+        self.phone_code_hashes: Dict[int, str] = {}  # Временное хранение хэшей кодов
         self.load_data()
     
     def load_data(self):
@@ -250,6 +251,19 @@ class DataManager:
     async def save_user(self, user: UserData):
         self.users[user.user_id] = user
         await self.save_data()
+    
+    def set_phone_code_hash(self, user_id: int, phone_code_hash: str):
+        """Сохранить хэш кода для пользователя"""
+        self.phone_code_hashes[user_id] = phone_code_hash
+    
+    def get_phone_code_hash(self, user_id: int) -> Optional[str]:
+        """Получить хэш кода для пользователя"""
+        return self.phone_code_hashes.get(user_id)
+    
+    def remove_phone_code_hash(self, user_id: int):
+        """Удалить хэш кода после использования"""
+        if user_id in self.phone_code_hashes:
+            del self.phone_code_hashes[user_id]
 
 data_manager = DataManager()
 
@@ -557,6 +571,7 @@ async def process_contact(message: types.Message, state: FSMContext):
     
     user.phone = message.contact.phone_number
     user.first_name = message.contact.first_name or ""
+    await data_manager.save_user(user)
     
     session_file = Config.SESSIONS_DIR / f"session_{user_id}"
     client = TelegramClient(str(session_file), Config.API_ID, Config.API_HASH)
@@ -565,11 +580,8 @@ async def process_contact(message: types.Message, state: FSMContext):
         await client.connect()
         sent_code = await client.send_code_request(user.phone)
         
-        await state.update_data(
-            client=client,
-            phone_code_hash=sent_code.phone_code_hash,
-            phone=user.phone
-        )
+        # Сохраняем хэш кода в DataManager вместо состояния
+        data_manager.set_phone_code_hash(user_id, sent_code.phone_code_hash)
         
         await message.answer(
             f"✅ *Код отправлен на:* `{user.phone}`\n\n"
@@ -589,8 +601,13 @@ async def process_contact(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ *Ошибка:* {str(e)[:100]}", parse_mode='markdown')
         await state.finish()
+    finally:
+        # Отключаем клиент, он не должен оставаться в состоянии
+        try:
+            await client.disconnect()
+        except:
+            pass
 
-# ВАЖНО: Этот декоратор должен быть именно такой!
 @dp.message_handler(state=BotStates.waiting_for_code)
 async def process_code(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -602,86 +619,144 @@ async def process_code(message: types.Message, state: FSMContext):
     
     # Проверяем, что это код (цифры)
     code = message.text.strip()
-    if not code.isdigit() or len(code) != 5:
+    
+    # БОЛЕЕ ГИБКАЯ ПРОВЕРКА КОДА - исправлено
+    # Код может быть 5 или 6 цифр, иногда с пробелами или дефисами
+    code_digits = ''.join(filter(str.isdigit, code))
+    
+    if not code_digits or len(code_digits) < 5 or len(code_digits) > 6:
         await message.answer(
             "❌ *Неверный формат кода!*\n\n"
-            "📝 *Введите 5 цифр из Telegram:*",
+            "📝 *Введите код из Telegram (5-6 цифр):*",
             parse_mode='markdown',
             reply_markup=get_cancel_keyboard()
         )
         return
     
-    data = await state.get_data()
-    client = data.get('client')
-    phone_code_hash = data.get('phone_code_hash')
-    phone = data.get('phone')
+    user = data_manager.get_user(user_id)
+    phone_code_hash = data_manager.get_phone_code_hash(user_id)
     
-    if not client:
-        await message.answer("❌ Ошибка клиента", parse_mode='markdown')
+    if not phone_code_hash:
+        await message.answer("❌ Ошибка: сессия устарела. Начните заново /start", parse_mode='markdown')
         await state.finish()
         return
     
+    # Создаем новый клиент
+    session_file = Config.SESSIONS_DIR / f"session_{user_id}"
+    client = TelegramClient(str(session_file), Config.API_ID, Config.API_HASH)
+    
     try:
-        await client.sign_in(
-            phone=phone,
-            code=code,
-            phone_code_hash=phone_code_hash
-        )
+        await client.connect()
         
-        user = data_manager.get_user(user_id)
-        user.is_authenticated = True
-        user.auth_date = datetime.now()
-        await data_manager.save_user(user)
-        
-        await message.answer(
-            "✅ *Аккаунт успешно подключен!*\n\n"
-            "Теперь вы можете использовать все функции бота.",
-            parse_mode='markdown',
-            reply_markup=get_main_keyboard()
-        )
-        
-    except SessionPasswordNeededError:
-        await message.answer("🔐 *Введите пароль двухфакторной аутентификации:*", parse_mode='markdown')
-        await BotStates.waiting_for_password.set()
-        return
-    except PhoneCodeInvalidError:
-        await message.answer(
-            "❌ *Неверный код!*\n\n"
-            "📝 *Попробуйте еще раз:*",
-            parse_mode='markdown',
-            reply_markup=get_cancel_keyboard()
-        )
-        return
+        # Пробуем войти с кодом
+        try:
+            await client.sign_in(
+                phone=user.phone,
+                code=code_digits,
+                phone_code_hash=phone_code_hash
+            )
+            
+            user.is_authenticated = True
+            user.auth_date = datetime.now()
+            await data_manager.save_user(user)
+            
+            await message.answer(
+                "✅ *Аккаунт успешно подключен!*\n\n"
+                "Теперь вы можете использовать все функции бота.",
+                parse_mode='markdown',
+                reply_markup=get_main_keyboard()
+            )
+            
+        except SessionPasswordNeededError:
+            # Сохраняем информацию о состоянии для ввода пароля
+            await state.update_data(
+                phone=user.phone,
+                phone_code_hash=phone_code_hash
+            )
+            
+            await message.answer(
+                "🔐 *Требуется двухфакторная аутентификация*\n"
+                "📝 *Введите пароль от аккаунта Telegram:*",
+                parse_mode='markdown',
+                reply_markup=get_cancel_keyboard()
+            )
+            
+            await BotStates.waiting_for_password.set()
+            return
+            
+        except PhoneCodeInvalidError:
+            await message.answer(
+                "❌ *Неверный код!*\n\n"
+                "📝 *Попробуйте еще раз:*",
+                parse_mode='markdown',
+                reply_markup=get_cancel_keyboard()
+            )
+            return
+            
+        except Exception as e:
+            await message.answer(f"❌ *Ошибка авторизации:* {str(e)[:100]}", parse_mode='markdown')
+            await state.finish()
+            
     except Exception as e:
-        await message.answer(f"❌ *Ошибка:* {str(e)[:100]}", parse_mode='markdown')
+        await message.answer(f"❌ *Ошибка подключения:* {str(e)[:100]}", parse_mode='markdown')
+        await state.finish()
     finally:
+        # Очищаем хэш кода
+        data_manager.remove_phone_code_hash(user_id)
         try:
             await client.disconnect()
         except:
             pass
-        await state.finish()
+        
+        if not await state.get_state():
+            await state.finish()
 
 @dp.message_handler(state=BotStates.waiting_for_password)
 async def process_password(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
+    
+    if message.text == "❌ Отмена":
+        await message.answer("❌ Отменено", reply_markup=ReplyKeyboardRemove())
+        await state.finish()
+        return
+    
     data = await state.get_data()
-    client = data.get('client')
+    phone = data.get('phone')
+    phone_code_hash = data.get('phone_code_hash')
+    
+    if not phone or not phone_code_hash:
+        await message.answer("❌ Ошибка сессии. Начните заново /start", parse_mode='markdown')
+        await state.finish()
+        return
+    
+    # Создаем новый клиент
+    session_file = Config.SESSIONS_DIR / f"session_{user_id}"
+    client = TelegramClient(str(session_file), Config.API_ID, Config.API_HASH)
     
     try:
-        await client.sign_in(password=message.text)
+        await client.connect()
         
-        user = data_manager.get_user(user_id)
-        user.is_authenticated = True
-        user.auth_date = datetime.now()
-        await data_manager.save_user(user)
-        
-        await message.answer(
-            "✅ *Аккаунт подключен!*",
-            parse_mode='markdown',
-            reply_markup=get_main_keyboard()
-        )
+        # Пытаемся войти с паролем
+        try:
+            await client.sign_in(password=message.text)
+            
+            user = data_manager.get_user(user_id)
+            user.is_authenticated = True
+            user.auth_date = datetime.now()
+            await data_manager.save_user(user)
+            
+            await message.answer(
+                "✅ *Аккаунт подключен!*\n\n"
+                "Теперь вы можете использовать все функции бота.",
+                parse_mode='markdown',
+                reply_markup=get_main_keyboard()
+            )
+            
+        except Exception as e:
+            await message.answer(f"❌ *Ошибка входа:* {str(e)[:100]}", parse_mode='markdown')
+            
     except Exception as e:
-        await message.answer(f"❌ *Ошибка:* {str(e)[:100]}", parse_mode='markdown')
+        await message.answer(f"❌ *Ошибка подключения:* {str(e)[:100]}", parse_mode='markdown')
     finally:
         try:
             await client.disconnect()
@@ -988,8 +1063,12 @@ async def refresh_chats(message: types.Message):
 
 @dp.message_handler(lambda m: m.text == "❌ Отмена")
 async def cancel_handler(message: types.Message, state: FSMContext):
-    await message.answer("❌ Действие отменено", reply_markup=get_main_keyboard())
-    await state.finish()
+    current_state = await state.get_state()
+    if current_state:
+        await message.answer("❌ Действие отменено", reply_markup=get_main_keyboard())
+        await state.finish()
+    else:
+        await message.answer("❌ Нет активного действия для отмены", reply_markup=get_main_keyboard())
 
 @dp.message_handler(commands=['clear'])
 async def clear_data(message: types.Message):
@@ -1034,6 +1113,7 @@ async def confirm_clear_data(callback_query: types.CallbackQuery):
     
     data_manager.active_tasks.clear()
     data_manager.users.clear()
+    data_manager.phone_code_hashes.clear()
     
     # Удаляем файлы
     try:
