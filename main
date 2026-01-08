@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-RETSING BOT - Автоматическая система рассылки сообщений
-Версия: 4.0 Pro
-Автор: 7370566881
+RETSING BOT - Полная версия с исправлениями
+Версия: 5.0 Pro
 """
 
 import os
@@ -14,7 +13,6 @@ import traceback
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Set, Union
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 import aiofiles
 
@@ -32,8 +30,7 @@ try:
         UserBannedInChannelError
     )
 except ImportError:
-    print("❌ Ошибка: Не установлены библиотеки!")
-    print("📦 Установите: pip install telethon aiogram aiofiles")
+    print("❌ Установите библиотеки: pip install telethon aiogram aiofiles")
     sys.exit(1)
 
 try:
@@ -50,8 +47,7 @@ try:
     )
     from aiogram.utils.exceptions import BotBlocked, ChatNotFound
 except ImportError:
-    print("❌ Ошибка: Не установлены библиотеки!")
-    print("📦 Установите: pip install aiogram")
+    print("❌ Установите: pip install aiogram")
     sys.exit(1)
 
 # ========== КОНФИГУРАЦИЯ ==========
@@ -63,15 +59,13 @@ class Config:
     API_HASH = "f5dd3f52675030a650ca2259f9fb79ce"
     BOT_TOKEN = "8379847495:AAHQIC5D9fipWz76h3-y0UOsY3amN5RUD_U"
     CREATOR_ID = 7370566881
-    BOT_NAME = "RETSING BOT"
-    BOT_USERNAME = "@RETSINGBOT"
     
     # Настройки рассылки
     MESSAGE_SIGNATURE = "\n\n━━━━━━━━━━━━━━━━━━━━\n📨 Сообщение пересылает бесплатный бот для рассылки [RETSING BOT](https://t.me/RETSINGBOT)"
     SEND_INTERVAL = 120  # 2 минуты между рассылками
     MAX_MESSAGE_LENGTH = 4000
     MAX_CHATS_DISPLAY = 100
-    REQUEST_DELAY = 1.5  # Задержка между сообщениями
+    REQUEST_DELAY = 1.5
     
     # Пути
     BASE_DIR = Path(__file__).parent
@@ -81,7 +75,6 @@ class Config:
     
     # Файлы
     USERS_FILE = DATA_DIR / "users.json"
-    ACTIVE_CAMPAIGNS = DATA_DIR / "campaigns.json"
     LOG_FILE = LOGS_DIR / "bot.log"
     
     @classmethod
@@ -90,7 +83,6 @@ class Config:
         for dir_path in [cls.SESSIONS_DIR, cls.DATA_DIR, cls.LOGS_DIR]:
             dir_path.mkdir(exist_ok=True)
 
-# Инициализация директорий
 Config.init_dirs()
 
 # ========== ЛОГИРОВАНИЕ ==========
@@ -115,7 +107,9 @@ class Chat:
     
     @property
     def display_name(self):
-        return f"{self.title} (@{self.username})" if self.username else self.title
+        if self.username:
+            return f"{self.title} (@{self.username})"
+        return self.title
 
 @dataclass
 class CampaignStats:
@@ -124,27 +118,18 @@ class CampaignStats:
     total_failed: int = 0
     start_time: Optional[datetime] = None
     last_send_time: Optional[datetime] = None
-    next_send_time: Optional[datetime] = None
     is_active: bool = False
     
     def start(self):
         self.start_time = datetime.now()
         self.is_active = True
-        self.update_next_send()
     
     def stop(self):
         self.is_active = False
     
-    def update_next_send(self):
-        if self.last_send_time:
-            self.next_send_time = self.last_send_time + timedelta(seconds=Config.SEND_INTERVAL)
-        else:
-            self.next_send_time = datetime.now() + timedelta(seconds=10)
-    
     def increment_sent(self):
         self.total_sent += 1
         self.last_send_time = datetime.now()
-        self.update_next_send()
     
     def increment_failed(self):
         self.total_failed += 1
@@ -162,13 +147,9 @@ class UserData:
     first_name: str = ""
     is_authenticated: bool = False
     auth_date: Optional[datetime] = None
-    
-    # Настройки рассылки
     message_text: str = ""
     selected_chats: Set[str] = field(default_factory=set)
     all_chats: List[Chat] = field(default_factory=list)
-    
-    # Статистика
     campaign_stats: CampaignStats = field(default_factory=CampaignStats)
     
     def to_dict(self):
@@ -252,15 +233,15 @@ class DataManager:
                 asyncio.run(load())
                 logger.info(f"Загружено {len(self.users)} пользователей")
         except Exception as e:
-            logger.error(f"Ошибка загрузки данных: {e}")
+            logger.error(f"Ошибка загрузки: {e}")
     
-    async def save_data_async(self):
+    async def save_data(self):
         try:
             data = {str(uid): user.to_dict() for uid, user in self.users.items()}
             async with aiofiles.open(Config.USERS_FILE, 'w', encoding='utf-8') as f:
-                await f.write(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
         except Exception as e:
-            logger.error(f"Ошибка сохранения данных: {e}")
+            logger.error(f"Ошибка сохранения: {e}")
     
     def get_user(self, user_id: int) -> UserData:
         if user_id not in self.users:
@@ -269,9 +250,8 @@ class DataManager:
     
     async def save_user(self, user: UserData):
         self.users[user.user_id] = user
-        await self.save_data_async()
+        await self.save_data()
 
-# Инициализация менеджеров
 data_manager = DataManager()
 
 # ========== СОСТОЯНИЯ ==========
@@ -288,7 +268,6 @@ dp = Dispatcher(bot, storage=storage)
 
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
-    """Главное меню"""
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     keyboard.add(
         "📝 Указать сообщение",
@@ -327,7 +306,8 @@ def create_chats_keyboard(chats: List[Chat], selected_ids: Set[str], page: int =
     if page > 0:
         nav_row.append(InlineKeyboardButton("◀️", callback_data=f"page_{page-1}"))
     
-    page_info = f"📄 {page+1}/{(len(chats)+PER_PAGE-1)//PER_PAGE}"
+    total_pages = (len(chats) + PER_PAGE - 1) // PER_PAGE
+    page_info = f"📄 {page+1}/{total_pages}" if total_pages > 0 else "📄 1/1"
     nav_row.append(InlineKeyboardButton(page_info, callback_data="current_page"))
     
     if end < len(chats):
@@ -445,15 +425,22 @@ async def start_campaign_loop(user_id: int):
     """Запуск цикла рассылки"""
     user = data_manager.get_user(user_id)
     
+    # Отменяем предыдущую задачу если есть
     if user_id in data_manager.active_tasks:
         task = data_manager.active_tasks[user_id]
         if not task.done():
             task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     
-    task = asyncio.create_task(_campaign_loop(user_id))
-    data_manager.active_tasks[user_id] = task
     user.campaign_stats.start()
     await data_manager.save_user(user)
+    
+    # Создаем новую задачу
+    task = asyncio.create_task(_campaign_loop(user_id))
+    data_manager.active_tasks[user_id] = task
     
     return task
 
@@ -465,18 +452,9 @@ async def _campaign_loop(user_id: int):
         client = await get_telegram_client(user_id)
         if not client:
             await bot.send_message(user_id, "❌ Не удалось подключиться к аккаунту")
+            user.campaign_stats.stop()
+            await data_manager.save_user(user)
             return
-        
-        await bot.send_message(
-            user_id,
-            "🔄 *Рассылка запущена!*\n\n"
-            "📊 *Параметры:*\n"
-            f"• Сообщение: {len(user.message_text)} символов\n"
-            f"• Чатов: {len(user.selected_chats)}\n"
-            f"• Интервал: {Config.SEND_INTERVAL//60} мин.\n\n"
-            "📈 *Статистика будет обновляться после каждой рассылки*",
-            parse_mode='markdown'
-        )
         
         iteration = 0
         while user.campaign_stats.is_active:
@@ -504,7 +482,11 @@ async def _campaign_loop(user_id: int):
                 f"*Статус:* {'🟢 Активна' if user.campaign_stats.is_active else '🔴 Остановлена'}"
             )
             
-            await bot.send_message(user_id, report, parse_mode='markdown')
+            try:
+                await bot.send_message(user_id, report, parse_mode='markdown')
+            except:
+                pass
+            
             await data_manager.save_user(user)
             
             # Ждем до следующей рассылки
@@ -512,24 +494,27 @@ async def _campaign_loop(user_id: int):
                 await asyncio.sleep(Config.SEND_INTERVAL)
                 
     except asyncio.CancelledError:
-        await bot.send_message(user_id, "🛑 *Рассылка остановлена*", parse_mode='markdown')
+        logger.info(f"Рассылка остановлена для пользователя {user_id}")
     except Exception as e:
         logger.error(f"Ошибка в цикле рассылки: {e}")
-        await bot.send_message(user_id, f"❌ *Ошибка:* {str(e)}", parse_mode='markdown')
+        try:
+            await bot.send_message(user_id, f"❌ *Ошибка рассылки:* {str(e)[:100]}", parse_mode='markdown')
+        except:
+            pass
     finally:
         if user_id in data_manager.active_tasks:
             del data_manager.active_tasks[user_id]
         user.campaign_stats.stop()
         await data_manager.save_user(user)
 
-# ========== ОБРАБОТЧИКИ ==========
+# ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
 @dp.message_handler(commands=['start', 'help'])
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     user = data_manager.get_user(user_id)
     
     welcome_text = (
-        f"👋 *Добро пожаловать в {Config.BOT_NAME}!*\n\n"
+        f"👋 *Добро пожаловать в RETSING BOT!*\n\n"
         f"🤖 *Автоматическая система рассылки сообщений*\n\n"
         f"📌 *Как использовать:*\n"
         f"1. Подключите аккаунт (отправьте контакт)\n"
@@ -542,14 +527,14 @@ async def cmd_start(message: types.Message):
     )
     
     if user.is_authenticated:
-        status = "🟢 Подключен" if user.campaign_stats.is_active else "⚪ Остановлена"
+        status = "🟢 Активна" if user.campaign_stats.is_active else "⚪ Остановлена"
         await message.answer(
             f"✅ *Вы авторизованы как:* {user.phone}\n\n"
             f"📊 *Статистика:*\n"
             f"• 📨 Отправлено: {user.campaign_stats.total_sent}\n"
             f"• ❌ Ошибок: {user.campaign_stats.total_failed}\n"
             f"• 📋 Чатов выбрано: {len(user.selected_chats)}\n"
-            f"• 🚀 Статус: {status}\n\n"
+            f"• 🚀 Статус рассылки: {status}\n\n"
             f"*Используйте меню для управления:*",
             parse_mode='markdown',
             reply_markup=get_main_keyboard()
@@ -565,7 +550,7 @@ async def cmd_start(message: types.Message):
 @dp.message_handler(content_types=['contact'], state=BotStates.waiting_for_phone)
 async def process_contact(message: types.Message, state: FSMContext):
     if not message.contact:
-        await message.answer("Отправьте контакт для продолжения", reply_markup=get_contact_keyboard())
+        await message.answer("❌ Отправьте контакт для продолжения", reply_markup=get_contact_keyboard())
         return
     
     user_id = message.from_user.id
@@ -577,9 +562,8 @@ async def process_contact(message: types.Message, state: FSMContext):
     session_file = Config.SESSIONS_DIR / f"session_{user_id}"
     client = TelegramClient(str(session_file), Config.API_ID, Config.API_HASH)
     
-    await client.connect()
-    
     try:
+        await client.connect()
         sent_code = await client.send_code_request(user.phone)
         
         await state.update_data(
@@ -589,7 +573,7 @@ async def process_contact(message: types.Message, state: FSMContext):
         )
         
         await message.answer(
-            f"📱 *Код отправлен на:* {user.phone}\n\n"
+            f"✅ *Код отправлен на:* `{user.phone}`\n\n"
             f"📝 *Введите код из Telegram:*",
             parse_mode='markdown',
             reply_markup=get_cancel_keyboard()
@@ -598,34 +582,52 @@ async def process_contact(message: types.Message, state: FSMContext):
         await BotStates.waiting_for_code.set()
         
     except FloodWaitError as e:
-        await message.answer(f"⏳ Ждите {e.seconds} секунд", parse_mode='markdown')
+        await message.answer(f"⏳ *Ждите {e.seconds} секунд*", parse_mode='markdown')
+        await state.finish()
+    except PhoneNumberInvalidError:
+        await message.answer("❌ *Неверный номер телефона*", parse_mode='markdown')
         await state.finish()
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}", parse_mode='markdown')
+        await message.answer(f"❌ *Ошибка:* {str(e)[:100]}", parse_mode='markdown')
         await state.finish()
 
-@dp.message_handler(state=BotStates.waiting_for_code)
-async def process_code(message: types.Message, state: FSMContext):
+@dp.message_handler(state=BotStates.waiting_async def process_code(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
     if message.text == "❌ Отмена":
         await message.answer("❌ Отменено", reply_markup=ReplyKeyboardRemove())
         await state.finish()
         return
     
-    user_id = message.from_user.id
-    user = data_manager.get_user(user_id)
-    data = await state.get_data()
+    # Проверяем, что это код (цифры)
+    code = message.text.strip()
+    if not code.isdigit() or len(code) != 5:
+        await message.answer(
+            "❌ *Неверный формат кода!*\n\n"
+            "📝 *Введите 5 цифр из Telegram:*",
+            parse_mode='markdown',
+            reply_markup=get_cancel_keyboard()
+        )
+        return
     
+    data = await state.get_data()
     client = data.get('client')
     phone_code_hash = data.get('phone_code_hash')
     phone = data.get('phone')
     
+    if not client:
+        await message.answer("❌ Ошибка клиента", parse_mode='markdown')
+        await state.finish()
+        return
+    
     try:
         await client.sign_in(
             phone=phone,
-            code=message.text.strip(),
+            code=code,
             phone_code_hash=phone_code_hash
         )
         
+        user = data_manager.get_user(user_id)
         user.is_authenticated = True
         user.auth_date = datetime.now()
         await data_manager.save_user(user)
@@ -638,17 +640,24 @@ async def process_code(message: types.Message, state: FSMContext):
         )
         
     except SessionPasswordNeededError:
-        await message.answer("🔐 Введите пароль 2FA:", parse_mode='markdown')
+        await message.answer("🔐 *Введите пароль двухфакторной аутентификации:*", parse_mode='markdown')
         await BotStates.waiting_for_password.set()
         return
     except PhoneCodeInvalidError:
-        await message.answer("❌ Неверный код, попробуйте еще раз:", parse_mode='markdown')
+        await message.answer(
+            "❌ *Неверный код!*\n\n"
+            "📝 *Попробуйте еще раз:*",
+            parse_mode='markdown',
+            reply_markup=get_cancel_keyboard()
+        )
         return
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}", parse_mode='markdown')
+        await message.answer(f"❌ *Ошибка:* {str(e)[:100]}", parse_mode='markdown')
     finally:
-        if client:
+        try:
             await client.disconnect()
+        except:
+            pass
         await state.finish()
 
 @dp.message_handler(state=BotStates.waiting_for_password)
@@ -659,6 +668,7 @@ async def process_password(message: types.Message, state: FSMContext):
     
     try:
         await client.sign_in(password=message.text)
+        
         user = data_manager.get_user(user_id)
         user.is_authenticated = True
         user.auth_date = datetime.now()
@@ -670,10 +680,12 @@ async def process_password(message: types.Message, state: FSMContext):
             reply_markup=get_main_keyboard()
         )
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}", parse_mode='markdown')
+        await message.answer(f"❌ *Ошибка:* {str(e)[:100]}", parse_mode='markdown')
     finally:
-        if client:
+        try:
             await client.disconnect()
+        except:
+            pass
         await state.finish()
 
 @dp.message_handler(lambda m: m.text == "📝 Указать сообщение")
@@ -682,7 +694,7 @@ async def set_message_handler(message: types.Message):
     user = data_manager.get_user(user_id)
     
     if not user.is_authenticated:
-        await message.answer("❌ Сначала подключите аккаунт", parse_mode='markdown')
+        await message.answer("❌ Сначала подключите аккаунт через /start", parse_mode='markdown')
         return
     
     await message.answer(
@@ -932,13 +944,6 @@ async def show_stats(message: types.Message):
         f"• 📂 Всего чатов в базе: {len(user.all_chats)}"
     )
     
-    if user.campaign_stats.is_active and user.campaign_stats.next_send_time:
-        time_left = user.campaign_stats.next_send_time - datetime.now()
-        if time_left.total_seconds() > 0:
-            mins_left = int(time_left.total_seconds() // 60)
-            secs_left = int(time_left.total_seconds() % 60)
-            stats_text += f"\n\n⏰ *Следующая отправка через:* {mins_left}м {secs_left}с"
-    
     await message.answer(stats_text, parse_mode='markdown')
 
 @dp.message_handler(commands=['refresh'])
@@ -1036,7 +1041,10 @@ async def confirm_clear_data(callback_query: types.CallbackQuery):
         
         # Удаляем сессии
         for session_file in Config.SESSIONS_DIR.glob("session_*"):
-            session_file.unlink()
+            try:
+                session_file.unlink()
+            except:
+                pass
     except Exception as e:
         logger.error(f"Ошибка удаления файлов: {e}")
     
@@ -1054,13 +1062,37 @@ async def cancel_clear_data(callback_query: types.CallbackQuery):
     await callback_query.message.edit_text("❌ Очистка отменена")
     await callback_query.answer()
 
+# ========== ОБРАБОТЧИК ДЛЯ ЛЮБЫХ ДРУГИХ СООБЩЕНИЙ ==========
+@dp.message_handler()
+async def handle_other_messages(message: types.Message):
+    """Обработка любых других сообщений"""
+    user_id = message.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    if not user.is_authenticated:
+        await message.answer(
+            "👋 *Добро пожаловать в RETSING BOT!*\n\n"
+            "Для начала работы отправьте свой контакт или нажмите /start",
+            parse_mode='markdown',
+            reply_markup=get_contact_keyboard()
+        )
+    else:
+        await message.answer(
+            "ℹ️ *Используйте кнопки меню или команды:*\n\n"
+            "/start - Главное меню\n"
+            "/launch - Запустить рассылку\n"
+            "/stop - Остановить рассылку\n"
+            "/status - Статистика\n"
+            "/refresh - Обновить чаты",
+            parse_mode='markdown',
+            reply_markup=get_main_keyboard()
+        )
+
 # ========== ЗАПУСК ==========
 async def on_startup(dp):
     """Действия при запуске бота"""
     logger.info("=" * 50)
-    logger.info(f"🚀 Запуск {Config.BOT_NAME} v4.0")
-    logger.info(f"👤 Создатель: {Config.CREATOR_ID}")
-    logger.info(f"🤖 Username: {Config.BOT_USERNAME}")
+    logger.info("🚀 Запуск RETSING BOT v5.0")
     logger.info("=" * 50)
     
     # Восстанавливаем активные рассылки
@@ -1082,15 +1114,14 @@ async def on_startup(dp):
     try:
         await bot.send_message(
             Config.CREATOR_ID,
-            f"🤖 *{Config.BOT_NAME} запущен!*\n\n"
+            f"🤖 *RETSING BOT запущен!*\n\n"
             f"🕐 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
             f"👥 Пользователей: {len(data_manager.users)}\n"
-            f"🔄 Восстановлено рассылок: {restored_count}\n"
-            f"📊 Активных задач: {len(data_manager.active_tasks)}",
+            f"🔄 Восстановлено рассылок: {restored_count}",
             parse_mode='markdown'
         )
     except Exception as e:
-        logger.error(f"Ошибка отправки уведомления создателю: {e}")
+        logger.error(f"Ошибка отправки уведомления: {e}")
 
 async def on_shutdown(dp):
     """Действия при выключении бота"""
@@ -1104,40 +1135,40 @@ async def on_shutdown(dp):
                 await task
             except asyncio.CancelledError:
                 pass
-            
-            user = data_manager.get_user(user_id)
-            user.campaign_stats.stop()
     
     # Сохраняем данные
-    await data_manager.save_data_async()
+    await data_manager.save_data()
     logger.info("✅ Данные сохранены")
-    
-    try:
-        await bot.send_message(
-            Config.CREATOR_ID,
-            f"🛑 *{Config.BOT_NAME} остановлен!*\n\n"
-            f"🕐 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
-            f"👥 Пользователей: {len(data_manager.users)}\n"
-            f"📊 Активных рассылок: {len(data_manager.active_tasks)}",
-            parse_mode='markdown'
-        )
-    except:
-        pass
 
 async def periodic_save():
     """Периодическое сохранение данных"""
     while True:
         await asyncio.sleep(300)  # Сохраняем каждые 5 минут
         try:
-            await data_manager.save_data_async()
+            await data_manager.save_data()
             logger.debug("Периодическое сохранение данных выполнено")
         except Exception as e:
             logger.error(f"Ошибка периодического сохранения: {e}")
 
-async def periodic_stats():
-    """Периодическая отправка статистики создателю"""
+async def monitor_active_campaigns():    """Мониторинг активных кампаний"""
+    while True:
+        await asyncio.sleep(30)  # Проверяем каждые 30 секунд
+        
+        try:
+            current_time = datetime.now()
+            for user_id, user in list(data_manager.users.items()):
+                if user.campaign_stats.is_active and user_id not in data_manager.active_tasks:
+                    # Кампания активна, но задачи нет - перезапускаем
+                    logger.warning(f"Восстанавливаем потерянную задачу для пользователя {user_id}")
+                    await start_campaign_loop(user_id)
+        except Exception as e:
+            logger.error(f"Ошибка в мониторинге кампаний: {e}")
+
+async def send_statistics_to_creator():
+    """Ежечасная отправка статистики создателю"""
     while True:
         await asyncio.sleep(3600)  # Каждый час
+        
         try:
             active_campaigns = sum(1 for user in data_manager.users.values() if user.campaign_stats.is_active)
             total_sent = sum(user.campaign_stats.total_sent for user in data_manager.users.values())
@@ -1152,69 +1183,66 @@ async def periodic_stats():
             
             await bot.send_message(
                 Config.CREATOR_ID,
-                f"📊 *Ежечасная статистика {Config.BOT_NAME}*\n\n"
+                f"📊 *Ежечасная статистика RETSING BOT*\n\n"
                 f"🕐 Время: {datetime.now().strftime('%H:%M:%S')}\n"
                 f"📅 Дата: {datetime.now().strftime('%d.%m.%Y')}\n\n"
                 f"👥 *Пользователи:*\n"
                 f"• Всего: {total_users}\n"
-                f"• Активных: {active_campaigns}\n\n"
+                f"• Активных рассылок: {active_campaigns}\n\n"
                 f"📨 *Рассылки:*\n"
                 f"• Успешно: {total_sent:,}\n"
                 f"• Ошибок: {total_failed:,}\n"
                 f"• Успешность: {success_rate:.1f}%\n\n"
                 f"🤖 *Система:*\n"
                 f"• Активных задач: {len(data_manager.active_tasks)}\n"
-                f"• Запущен: {datetime.now().strftime('%d.%m.%Y')}",
+                f"• Запущен: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
                 parse_mode='markdown'
             )
         except Exception as e:
             logger.error(f"Ошибка отправки статистики: {e}")
 
-async def monitor_active_campaigns():
-    """Мониторинг активных кампаний"""
+async def cleanup_old_sessions():
+    """Очистка устаревших сессий"""
     while True:
-        await asyncio.sleep(60)  # Проверяем каждую минуту
+        await asyncio.sleep(86400)  # Каждые 24 часа
         
         try:
-            current_time = datetime.now()
-            for user_id, user in list(data_manager.users.items()):
-                if user.campaign_stats.is_active:
-                    # Проверяем, не зависла ли задача
-                    if user_id in data_manager.active_tasks:
-                        task = data_manager.active_tasks[user_id]
-                        if task.done():
-                            # Задача завершена (ошибка или остановка)
-                            try:
-                                task.result()  # Проверяем исключения
-                            except (asyncio.CancelledError, Exception):
-                                pass
-                            
-                            # Если задача завершилась, но рассылка должна быть активной, перезапускаем
-                            if user.campaign_stats.is_active:
-                                logger.warning(f"Перезапускаем зависшую рассылку для пользователя {user_id}")
-                                await start_campaign_loop(user_id)
-                    else:
-                        # Задачи нет, но рассылка активна - перезапускаем
-                        if user.campaign_stats.is_active:
-                            logger.warning(f"Восстанавливаем потерянную задачу для пользователя {user_id}")
-                            await start_campaign_loop(user_id)
+            for session_file in Config.SESSIONS_DIR.glob("session_*"):
+                try:
+                    # Проверяем время последнего изменения
+                    stat = session_file.stat()
+                    last_modified = datetime.fromtimestamp(stat.st_mtime)
+                    if (datetime.now() - last_modified).days > 30:
+                        session_file.unlink()
+                        logger.info(f"Удалена устаревшая сессия: {session_file.name}")
+                except Exception as e:
+                    logger.error(f"Ошибка при очистке сессии {session_file}: {e}")
         except Exception as e:
-            logger.error(f"Ошибка в мониторинге кампаний: {e}")
+            logger.error(f"Ошибка в очистке сессий: {e}")
 
 if __name__ == '__main__':
-    logger.info(f"🚀 Запуск {Config.BOT_NAME}...")
+    logger.info("🚀 Запуск RETSING BOT...")
     
     # Запускаем фоновые задачи
     loop = asyncio.get_event_loop()
     loop.create_task(periodic_save())
-    loop.create_task(periodic_stats())
     loop.create_task(monitor_active_campaigns())
+    loop.create_task(send_statistics_to_creator())
+    loop.create_task(cleanup_old_sessions())
     
-    # Запуск бота
-    executor.start_polling(
-        dp,
-        skip_updates=True,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown,
-        timeout=60
-    )
+    try:
+        # Запуск бота
+        executor.start_polling(
+            dp,
+            skip_updates=True,
+            on_startup=on_startup,
+            on_shutdown=on_shutdown,
+            timeout=60
+        )
+    except KeyboardInterrupt:
+        logger.info("🛑 Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        logger.info("👋 RETSING BOT завершил работу")
