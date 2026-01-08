@@ -1,0 +1,1220 @@
+#!/usr/bin/env python3
+"""
+RETSING BOT - Автоматическая система рассылки сообщений
+Версия: 4.0 Pro
+Автор: 7370566881
+"""
+
+import os
+import sys
+import json
+import asyncio
+import logging
+import traceback
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Set, Union
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+import aiofiles
+
+# Проверка зависимостей
+try:
+    from telethon import TelegramClient, functions, types
+    from telethon.errors import (
+        SessionPasswordNeededError,
+        PhoneCodeInvalidError,
+        PhoneNumberInvalidError,
+        FloodWaitError,
+        AuthKeyError,
+        ChatWriteForbiddenError,
+        ChannelPrivateError,
+        UserBannedInChannelError
+    )
+except ImportError:
+    print("❌ Ошибка: Не установлены библиотеки!")
+    print("📦 Установите: pip install telethon aiogram aiofiles")
+    sys.exit(1)
+
+try:
+    from aiogram import Bot, Dispatcher, types, executor
+    from aiogram.contrib.fsm_storage.memory import MemoryStorage
+    from aiogram.dispatcher import FSMContext
+    from aiogram.dispatcher.filters.state import State, StatesGroup
+    from aiogram.types import (
+        ReplyKeyboardMarkup,
+        KeyboardButton,
+        ReplyKeyboardRemove,
+        InlineKeyboardMarkup,
+        InlineKeyboardButton
+    )
+    from aiogram.utils.exceptions import BotBlocked, ChatNotFound
+except ImportError:
+    print("❌ Ошибка: Не установлены библиотеки!")
+    print("📦 Установите: pip install aiogram")
+    sys.exit(1)
+
+# ========== КОНФИГУРАЦИЯ ==========
+class Config:
+    """Конфигурация бота"""
+    
+    # API данные
+    API_ID = 23258474
+    API_HASH = "f5dd3f52675030a650ca2259f9fb79ce"
+    BOT_TOKEN = "8379847495:AAHQIC5D9fipWz76h3-y0UOsY3amN5RUD_U"
+    CREATOR_ID = 7370566881
+    BOT_NAME = "RETSING BOT"
+    BOT_USERNAME = "@RETSINGBOT"
+    
+    # Настройки рассылки
+    MESSAGE_SIGNATURE = "\n\n━━━━━━━━━━━━━━━━━━━━\n📨 Сообщение пересылает бесплатный бот для рассылки [RETSING BOT](https://t.me/RETSINGBOT)"
+    SEND_INTERVAL = 120  # 2 минуты между рассылками
+    MAX_MESSAGE_LENGTH = 4000
+    MAX_CHATS_DISPLAY = 100
+    REQUEST_DELAY = 1.5  # Задержка между сообщениями
+    
+    # Пути
+    BASE_DIR = Path(__file__).parent
+    SESSIONS_DIR = BASE_DIR / "sessions"
+    DATA_DIR = BASE_DIR / "data"
+    LOGS_DIR = BASE_DIR / "logs"
+    
+    # Файлы
+    USERS_FILE = DATA_DIR / "users.json"
+    ACTIVE_CAMPAIGNS = DATA_DIR / "campaigns.json"
+    LOG_FILE = LOGS_DIR / "bot.log"
+    
+    @classmethod
+    def init_dirs(cls):
+        """Создание директорий"""
+        for dir_path in [cls.SESSIONS_DIR, cls.DATA_DIR, cls.LOGS_DIR]:
+            dir_path.mkdir(exist_ok=True)
+
+# Инициализация директорий
+Config.init_dirs()
+
+# ========== ЛОГИРОВАНИЕ ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(Config.LOG_FILE, encoding='utf-8', mode='a'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ========== МОДЕЛИ ДАННЫХ ==========
+@dataclass
+class Chat:
+    """Модель чата"""
+    id: int
+    title: str
+    type: str
+    username: str = ""
+    
+    @property
+    def display_name(self):
+        return f"{self.title} (@{self.username})" if self.username else self.title
+
+@dataclass
+class CampaignStats:
+    """Статистика кампании"""
+    total_sent: int = 0
+    total_failed: int = 0
+    start_time: Optional[datetime] = None
+    last_send_time: Optional[datetime] = None
+    next_send_time: Optional[datetime] = None
+    is_active: bool = False
+    
+    def start(self):
+        self.start_time = datetime.now()
+        self.is_active = True
+        self.update_next_send()
+    
+    def stop(self):
+        self.is_active = False
+    
+    def update_next_send(self):
+        if self.last_send_time:
+            self.next_send_time = self.last_send_time + timedelta(seconds=Config.SEND_INTERVAL)
+        else:
+            self.next_send_time = datetime.now() + timedelta(seconds=10)
+    
+    def increment_sent(self):
+        self.total_sent += 1
+        self.last_send_time = datetime.now()
+        self.update_next_send()
+    
+    def increment_failed(self):
+        self.total_failed += 1
+    
+    def get_duration(self):
+        if self.start_time:
+            return datetime.now() - self.start_time
+        return timedelta(0)
+
+@dataclass
+class UserData:
+    """Данные пользователя"""
+    user_id: int
+    phone: str = ""
+    first_name: str = ""
+    is_authenticated: bool = False
+    auth_date: Optional[datetime] = None
+    
+    # Настройки рассылки
+    message_text: str = ""
+    selected_chats: Set[str] = field(default_factory=set)
+    all_chats: List[Chat] = field(default_factory=list)
+    
+    # Статистика
+    campaign_stats: CampaignStats = field(default_factory=CampaignStats)
+    
+    def to_dict(self):
+        return {
+            'user_id': self.user_id,
+            'phone': self.phone,
+            'first_name': self.first_name,
+            'is_authenticated': self.is_authenticated,
+            'auth_date': self.auth_date.isoformat() if self.auth_date else None,
+            'message_text': self.message_text,
+            'selected_chats': list(self.selected_chats),
+            'all_chats': [
+                {
+                    'id': chat.id,
+                    'title': chat.title,
+                    'type': chat.type,
+                    'username': chat.username
+                }
+                for chat in self.all_chats
+            ],
+            'campaign_stats': {
+                'total_sent': self.campaign_stats.total_sent,
+                'total_failed': self.campaign_stats.total_failed,
+                'start_time': self.campaign_stats.start_time.isoformat() if self.campaign_stats.start_time else None,
+                'last_send_time': self.campaign_stats.last_send_time.isoformat() if self.campaign_stats.last_send_time else None,
+                'is_active': self.campaign_stats.is_active
+            }
+        }
+    
+    @classmethod
+    def from_dict(cls, data):
+        user_data = cls(
+            user_id=data['user_id'],
+            phone=data.get('phone', ''),
+            first_name=data.get('first_name', ''),
+            is_authenticated=data.get('is_authenticated', False),
+            auth_date=datetime.fromisoformat(data['auth_date']) if data.get('auth_date') else None,
+            message_text=data.get('message_text', '')
+        )
+        
+        user_data.selected_chats = set(data.get('selected_chats', []))
+        
+        chat_list = data.get('all_chats', [])
+        user_data.all_chats = [
+            Chat(
+                id=chat['id'],
+                title=chat['title'],
+                type=chat['type'],
+                username=chat.get('username', '')
+            )
+            for chat in chat_list
+        ]
+        
+        stats_data = data.get('campaign_stats', {})
+        user_data.campaign_stats = CampaignStats(
+            total_sent=stats_data.get('total_sent', 0),
+            total_failed=stats_data.get('total_failed', 0),
+            start_time=datetime.fromisoformat(stats_data['start_time']) if stats_data.get('start_time') else None,
+            last_send_time=datetime.fromisoformat(stats_data['last_send_time']) if stats_data.get('last_send_time') else None,
+            is_active=stats_data.get('is_active', False)
+        )
+        
+        return user_data
+
+# ========== МЕНЕДЖЕР ДАННЫХ ==========
+class DataManager:
+    def __init__(self):
+        self.users: Dict[int, UserData] = {}
+        self.active_tasks: Dict[int, asyncio.Task] = {}
+        self.load_data()
+    
+    def load_data(self):
+        try:
+            if Config.USERS_FILE.exists():
+                async def load():
+                    async with aiofiles.open(Config.USERS_FILE, 'r', encoding='utf-8') as f:
+                        data = json.loads(await f.read())
+                        for user_id_str, user_data in data.items():
+                            user = UserData.from_dict(user_data)
+                            self.users[user.user_id] = user
+                asyncio.run(load())
+                logger.info(f"Загружено {len(self.users)} пользователей")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки данных: {e}")
+    
+    async def save_data_async(self):
+        try:
+            data = {str(uid): user.to_dict() for uid, user in self.users.items()}
+            async with aiofiles.open(Config.USERS_FILE, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+        except Exception as e:
+            logger.error(f"Ошибка сохранения данных: {e}")
+    
+    def get_user(self, user_id: int) -> UserData:
+        if user_id not in self.users:
+            self.users[user_id] = UserData(user_id=user_id)
+        return self.users[user_id]
+    
+    async def save_user(self, user: UserData):
+        self.users[user.user_id] = user
+        await self.save_data_async()
+
+# Инициализация менеджеров
+data_manager = DataManager()
+
+# ========== СОСТОЯНИЯ ==========
+class BotStates(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_code = State()
+    waiting_for_password = State()
+    waiting_for_message = State()
+
+# ========== ИНИЦИАЛИЗАЦИЯ БОТА ==========
+bot = Bot(token=Config.BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+
+# ========== КЛАВИАТУРЫ ==========
+def get_main_keyboard():
+    """Главное меню"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(
+        "📝 Указать сообщение",
+        "📋 Выбрать чаты",
+        "🚀 Запустить рассылку",
+        "⏸ Остановить рассылку",
+        "📊 Статистика",
+        "🔄 Обновить чаты"
+    )
+    return keyboard
+
+def get_cancel_keyboard():
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add("❌ Отмена")
+    return keyboard
+
+def get_contact_keyboard():
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add(KeyboardButton("📱 Отправить контакт", request_contact=True))
+    keyboard.add("❌ Отмена")
+    return keyboard
+
+def create_chats_keyboard(chats: List[Chat], selected_ids: Set[str], page: int = 0):
+    PER_PAGE = 8
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    
+    keyboard = []
+    for chat in chats[start:end]:
+        emoji = "✅" if str(chat.id) in selected_ids else "❌"
+        text = f"{emoji} {chat.title[:25]}"
+        keyboard.append([InlineKeyboardButton(text, callback_data=f"chat_{chat.id}")])
+    
+    # Навигация
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️", callback_data=f"page_{page-1}"))
+    
+    page_info = f"📄 {page+1}/{(len(chats)+PER_PAGE-1)//PER_PAGE}"
+    nav_row.append(InlineKeyboardButton(page_info, callback_data="current_page"))
+    
+    if end < len(chats):
+        nav_row.append(InlineKeyboardButton("▶️", callback_data=f"page_{page+1}"))
+    
+    if nav_row:
+        keyboard.append(nav_row)
+    
+    # Кнопки действий
+    keyboard.append([
+        InlineKeyboardButton("✅ Всё", callback_data="select_all"),
+        InlineKeyboardButton("❌ Ничего", callback_data="deselect_all")
+    ])
+    
+    keyboard.append([
+        InlineKeyboardButton("💾 Сохранить", callback_data="save_selection")
+    ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+# ========== ХЕЛПЕРЫ ==========
+async def get_telegram_client(user_id: int) -> Optional[TelegramClient]:
+    """Получение клиента Telegram"""
+    try:
+        session_file = Config.SESSIONS_DIR / f"session_{user_id}"
+        client = TelegramClient(
+            str(session_file),
+            Config.API_ID,
+            Config.API_HASH,
+            device_model="iPhone 14 Pro",
+            system_version="16.0",
+            app_version="10.0.0"
+        )
+        
+        await client.connect()
+        if await client.is_user_authorized():
+            return client
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка создания клиента: {e}")
+        return None
+
+async def get_user_chats(user_id: int) -> List[Chat]:
+    """Получение чатов пользователя"""
+    client = await get_telegram_client(user_id)
+    if not client:
+        return []
+    
+    try:
+        chats = []
+        dialogs = await client.get_dialogs(limit=Config.MAX_CHATS_DISPLAY)
+        
+        for dialog in dialogs:
+            if dialog.is_user or dialog.is_group or dialog.is_channel:
+                entity = dialog.entity
+                
+                chat_type = "private"
+                if dialog.is_group:
+                    chat_type = "group"
+                elif dialog.is_channel:
+                    chat_type = "channel"
+                
+                username = ""
+                if hasattr(entity, 'username') and entity.username:
+                    username = entity.username
+                
+                chats.append(Chat(
+                    id=entity.id,
+                    title=dialog.title,
+                    type=chat_type,
+                    username=username
+                ))
+        
+        return chats
+    except Exception as e:
+        logger.error(f"Ошибка получения чатов: {e}")
+        return []
+    finally:
+        if client:
+            await client.disconnect()
+
+async def send_broadcast(user: UserData, client: TelegramClient) -> tuple[int, int]:
+    """Отправка рассылки"""
+    success = 0
+    failed = 0
+    
+    for chat_id_str in user.selected_chats:
+        try:
+            chat_id = int(chat_id_str)
+            await client.send_message(
+                chat_id,
+                user.message_text,
+                parse_mode='markdown',
+                link_preview=False
+            )
+            success += 1
+            await asyncio.sleep(Config.REQUEST_DELAY)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+            try:
+                await client.send_message(chat_id, user.message_text, parse_mode='markdown')
+                success += 1
+            except:
+                failed += 1
+        except (ChatWriteForbiddenError, ChannelPrivateError, 
+                UserBannedInChannelError, ValueError):
+            failed += 1
+        except Exception as e:
+            logger.error(f"Ошибка отправки в чат {chat_id_str}: {e}")
+            failed += 1
+    
+    return success, failed
+
+async def start_campaign_loop(user_id: int):
+    """Запуск цикла рассылки"""
+    user = data_manager.get_user(user_id)
+    
+    if user_id in data_manager.active_tasks:
+        task = data_manager.active_tasks[user_id]
+        if not task.done():
+            task.cancel()
+    
+    task = asyncio.create_task(_campaign_loop(user_id))
+    data_manager.active_tasks[user_id] = task
+    user.campaign_stats.start()
+    await data_manager.save_user(user)
+    
+    return task
+
+async def _campaign_loop(user_id: int):
+    """Основной цикл рассылки"""
+    user = data_manager.get_user(user_id)
+    
+    try:
+        client = await get_telegram_client(user_id)
+        if not client:
+            await bot.send_message(user_id, "❌ Не удалось подключиться к аккаунту")
+            return
+        
+        await bot.send_message(
+            user_id,
+            "🔄 *Рассылка запущена!*\n\n"
+            "📊 *Параметры:*\n"
+            f"• Сообщение: {len(user.message_text)} символов\n"
+            f"• Чатов: {len(user.selected_chats)}\n"
+            f"• Интервал: {Config.SEND_INTERVAL//60} мин.\n\n"
+            "📈 *Статистика будет обновляться после каждой рассылки*",
+            parse_mode='markdown'
+        )
+        
+        iteration = 0
+        while user.campaign_stats.is_active:
+            iteration += 1
+            
+            # Отправляем рассылку
+            start_time = datetime.now()
+            success, failed = await send_broadcast(user, client)
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            
+            # Обновляем статистику
+            user.campaign_stats.total_sent += success
+            user.campaign_stats.total_failed += failed
+            user.campaign_stats.last_send_time = end_time
+            
+            # Отправляем отчет
+            report = (
+                f"📊 *Отчет #{iteration}*\n\n"
+                f"✅ *Успешно:* {success}\n"
+                f"❌ *Ошибки:* {failed}\n"
+                f"⏱ *Время:* {duration:.1f} сек.\n"
+                f"📨 *Всего отправлено:* {user.campaign_stats.total_sent}\n"
+                f"🔄 *Следующая отправка:* через {Config.SEND_INTERVAL//60} мин.\n\n"
+                f"*Статус:* {'🟢 Активна' if user.campaign_stats.is_active else '🔴 Остановлена'}"
+            )
+            
+            await bot.send_message(user_id, report, parse_mode='markdown')
+            await data_manager.save_user(user)
+            
+            # Ждем до следующей рассылки
+            if user.campaign_stats.is_active:
+                await asyncio.sleep(Config.SEND_INTERVAL)
+                
+    except asyncio.CancelledError:
+        await bot.send_message(user_id, "🛑 *Рассылка остановлена*", parse_mode='markdown')
+    except Exception as e:
+        logger.error(f"Ошибка в цикле рассылки: {e}")
+        await bot.send_message(user_id, f"❌ *Ошибка:* {str(e)}", parse_mode='markdown')
+    finally:
+        if user_id in data_manager.active_tasks:
+            del data_manager.active_tasks[user_id]
+        user.campaign_stats.stop()
+        await data_manager.save_user(user)
+
+# ========== ОБРАБОТЧИКИ ==========
+@dp.message_handler(commands=['start', 'help'])
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    welcome_text = (
+        f"👋 *Добро пожаловать в {Config.BOT_NAME}!*\n\n"
+        f"🤖 *Автоматическая система рассылки сообщений*\n\n"
+        f"📌 *Как использовать:*\n"
+        f"1. Подключите аккаунт (отправьте контакт)\n"
+        f"2. Укажите сообщение для рассылки\n"
+        f"3. Выберите чаты из списка\n"
+        f"4. Запустите рассылку командой /launch\n"
+        f"5. Остановите командой /stop\n\n"
+        f"⚡ *Рассылка будет повторяться каждые 2 минуты*\n"
+        f"📊 *Вы будете получать подробную статистику*"
+    )
+    
+    if user.is_authenticated:
+        status = "🟢 Подключен" if user.campaign_stats.is_active else "⚪ Остановлена"
+        await message.answer(
+            f"✅ *Вы авторизованы как:* {user.phone}\n\n"
+            f"📊 *Статистика:*\n"
+            f"• 📨 Отправлено: {user.campaign_stats.total_sent}\n"
+            f"• ❌ Ошибок: {user.campaign_stats.total_failed}\n"
+            f"• 📋 Чатов выбрано: {len(user.selected_chats)}\n"
+            f"• 🚀 Статус: {status}\n\n"
+            f"*Используйте меню для управления:*",
+            parse_mode='markdown',
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await message.answer(
+            welcome_text,
+            parse_mode='markdown',
+            reply_markup=get_contact_keyboard()
+        )
+        await BotStates.waiting_for_phone.set()
+
+@dp.message_handler(content_types=['contact'], state=BotStates.waiting_for_phone)
+async def process_contact(message: types.Message, state: FSMContext):
+    if not message.contact:
+        await message.answer("Отправьте контакт для продолжения", reply_markup=get_contact_keyboard())
+        return
+    
+    user_id = message.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    user.phone = message.contact.phone_number
+    user.first_name = message.contact.first_name or ""
+    
+    session_file = Config.SESSIONS_DIR / f"session_{user_id}"
+    client = TelegramClient(str(session_file), Config.API_ID, Config.API_HASH)
+    
+    await client.connect()
+    
+    try:
+        sent_code = await client.send_code_request(user.phone)
+        
+        await state.update_data(
+            client=client,
+            phone_code_hash=sent_code.phone_code_hash,
+            phone=user.phone
+        )
+        
+        await message.answer(
+            f"📱 *Код отправлен на:* {user.phone}\n\n"
+            f"📝 *Введите код из Telegram:*",
+            parse_mode='markdown',
+            reply_markup=get_cancel_keyboard()
+        )
+        
+        await BotStates.waiting_for_code.set()
+        
+    except FloodWaitError as e:
+        await message.answer(f"⏳ Ждите {e.seconds} секунд", parse_mode='markdown')
+        await state.finish()
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}", parse_mode='markdown')
+        await state.finish()
+
+@dp.message_handler(state=BotStates.waiting_for_code)
+async def process_code(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await message.answer("❌ Отменено", reply_markup=ReplyKeyboardRemove())
+        await state.finish()
+        return
+    
+    user_id = message.from_user.id
+    user = data_manager.get_user(user_id)
+    data = await state.get_data()
+    
+    client = data.get('client')
+    phone_code_hash = data.get('phone_code_hash')
+    phone = data.get('phone')
+    
+    try:
+        await client.sign_in(
+            phone=phone,
+            code=message.text.strip(),
+            phone_code_hash=phone_code_hash
+        )
+        
+        user.is_authenticated = True
+        user.auth_date = datetime.now()
+        await data_manager.save_user(user)
+        
+        await message.answer(
+            "✅ *Аккаунт успешно подключен!*\n\n"
+            "Теперь вы можете использовать все функции бота.",
+            parse_mode='markdown',
+            reply_markup=get_main_keyboard()
+        )
+        
+    except SessionPasswordNeededError:
+        await message.answer("🔐 Введите пароль 2FA:", parse_mode='markdown')
+        await BotStates.waiting_for_password.set()
+        return
+    except PhoneCodeInvalidError:
+        await message.answer("❌ Неверный код, попробуйте еще раз:", parse_mode='markdown')
+        return
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}", parse_mode='markdown')
+    finally:
+        if client:
+            await client.disconnect()
+        await state.finish()
+
+@dp.message_handler(state=BotStates.waiting_for_password)
+async def process_password(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    client = data.get('client')
+    
+    try:
+        await client.sign_in(password=message.text)
+        user = data_manager.get_user(user_id)
+        user.is_authenticated = True
+        user.auth_date = datetime.now()
+        await data_manager.save_user(user)
+        
+        await message.answer(
+            "✅ *Аккаунт подключен!*",
+            parse_mode='markdown',
+            reply_markup=get_main_keyboard()
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}", parse_mode='markdown')
+    finally:
+        if client:
+            await client.disconnect()
+        await state.finish()
+
+@dp.message_handler(lambda m: m.text == "📝 Указать сообщение")
+async def set_message_handler(message: types.Message):
+    user_id = message.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    if not user.is_authenticated:
+        await message.answer("❌ Сначала подключите аккаунт", parse_mode='markdown')
+        return
+    
+    await message.answer(
+        "📝 *Введите текст для рассылки:*\n\n"
+        "ℹ️ *Примечание:* К сообщению автоматически добавится подпись бота",
+        parse_mode='markdown',
+        reply_markup=get_cancel_keyboard()
+    )
+    await BotStates.waiting_for_message.set()
+
+@dp.message_handler(state=BotStates.waiting_for_message)
+async def process_message_text(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await message.answer("❌ Отменено", reply_markup=get_main_keyboard())
+        await state.finish()
+        return
+    
+    user_id = message.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    # Добавляем подпись
+    full_message = message.text + Config.MESSAGE_SIGNATURE
+    
+    if len(full_message) > Config.MAX_MESSAGE_LENGTH:
+        await message.answer(f"❌ Сообщение слишком длинное ({len(full_message)}/{Config.MAX_MESSAGE_LENGTH})", parse_mode='markdown')
+        return
+    
+    user.message_text = full_message
+    await data_manager.save_user(user)
+    
+    preview = full_message[:200] + "..." if len(full_message) > 200 else full_message
+    await message.answer(
+        f"✅ *Сообщение сохранено!*\n\n"
+        f"*Предпросмотр:*\n{preview}\n\n"
+        f"📊 *Длина:* {len(full_message)} символов",
+        parse_mode='markdown',
+        reply_markup=get_main_keyboard()
+    )
+    await state.finish()
+
+@dp.message_handler(lambda m: m.text == "📋 Выбрать чаты")
+async def select_chats_handler(message: types.Message):
+    user_id = message.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    if not user.is_authenticated:
+        await message.answer("❌ Сначала подключите аккаунт", parse_mode='markdown')
+        return
+    
+    if not user.message_text:
+        await message.answer("❌ Сначала укажите сообщение", parse_mode='markdown')
+        return
+    
+    await message.answer("🔄 *Получаю список ваших чатов...*", parse_mode='markdown')
+    
+    chats = await get_user_chats(user_id)
+    if not chats:
+        await message.answer("❌ Не удалось получить чаты. Проверьте подключение.", parse_mode='markdown')
+        return
+    
+    user.all_chats = chats
+    await data_manager.save_user(user)
+    
+    keyboard = create_chats_keyboard(chats, user.selected_chats)
+    
+    await message.answer(
+        f"📋 *Выберите чаты для рассылки:*\n"
+        f"✅ - выбран, ❌ - не выбран\n\n"
+        f"*Найдено:* {len(chats)} чатов\n"
+        f"*Выбрано:* {len(user.selected_chats)}",
+        parse_mode='markdown',
+        reply_markup=keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith('chat_'))
+async def process_chat_selection(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    chat_id = callback_query.data.split('_')[1]
+    
+    if chat_id in user.selected_chats:
+        user.selected_chats.remove(chat_id)
+    else:
+        user.selected_chats.add(chat_id)
+    
+    await data_manager.save_user(user)
+    
+    keyboard = create_chats_keyboard(user.all_chats, user.selected_chats)
+    await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+    await callback_query.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith('page_'))
+async def process_page_change(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    page = int(callback_query.data.split('_')[1])
+    keyboard = create_chats_keyboard(user.all_chats, user.selected_chats, page)
+    
+    await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+    await callback_query.answer()
+
+@dp.callback_query_handler(lambda c: c.data == 'select_all')
+async def select_all_chats(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    user.selected_chats = {str(chat.id) for chat in user.all_chats}
+    await data_manager.save_user(user)
+    
+    keyboard = create_chats_keyboard(user.all_chats, user.selected_chats)
+    await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+    await callback_query.answer("✅ Все чаты выбраны")
+
+@dp.callback_query_handler(lambda c: c.data == 'deselect_all')
+async def deselect_all_chats(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    user.selected_chats.clear()
+    await data_manager.save_user(user)
+    
+    keyboard = create_chats_keyboard(user.all_chats, user.selected_chats)
+    await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+    await callback_query.answer("❌ Выбор очищен")
+
+@dp.callback_query_handler(lambda c: c.data == 'save_selection')
+async def save_chats_selection(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    await callback_query.message.edit_text(
+        f"✅ *Список чатов сохранен!*\n\n"
+        f"📊 *Статистика:*\n"
+        f"• Всего чатов: {len(user.all_chats)}\n"
+        f"• Выбрано: {len(user.selected_chats)}\n\n"
+        f"Теперь можно запустить рассылку командой /launch",
+        parse_mode='markdown'
+    )
+    await callback_query.answer()
+
+@dp.message_handler(commands=['launch'])
+@dp.message_handler(lambda m: m.text == "🚀 Запустить рассылку")
+async def launch_campaign(message: types.Message):
+    user_id = message.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    if not user.is_authenticated:
+        await message.answer("❌ Сначала подключите аккаунт через /start", parse_mode='markdown')
+        return
+    
+    if not user.message_text:
+        await message.answer("❌ Сначала укажите сообщение для рассылки", parse_mode='markdown')
+        return
+    
+    if not user.selected_chats:
+        await message.answer("❌ Сначала выберите чаты для рассылки", parse_mode='markdown')
+        return
+    
+    if user.campaign_stats.is_active:
+        await message.answer("⚠️ Рассылка уже запущена! Используйте /stop для остановки", parse_mode='markdown')
+        return
+    
+    # Запускаем рассылку
+    await start_campaign_loop(user_id)
+    
+    await message.answer(
+        "🚀 *Рассылка запущена!*\n\n"
+        f"📨 *Сообщение:* {len(user.message_text)} символов\n"
+        f"📋 *Чатов:* {len(user.selected_chats)}\n"
+        f"⏱ *Интервал:* {Config.SEND_INTERVAL//60} минут\n\n"
+        f"📊 *Статистика будет приходить каждые {Config.SEND_INTERVAL//60} минут*\n"
+        f"🛑 *Для остановки используйте /stop*",
+        parse_mode='markdown'
+    )
+
+@dp.message_handler(commands=['stop'])
+@dp.message_handler(lambda m: m.text == "⏸ Остановить рассылку")
+async def stop_campaign(message: types.Message):
+    user_id = message.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    if not user.campaign_stats.is_active:
+        await message.answer("ℹ️ Рассылка не активна", parse_mode='markdown')
+        return
+    
+    # Останавливаем задачу
+    if user_id in data_manager.active_tasks:
+        task = data_manager.active_tasks[user_id]
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        del data_manager.active_tasks[user_id]
+    
+    user.campaign_stats.stop()
+    await data_manager.save_user(user)
+    
+    duration = user.campaign_stats.get_duration()
+    hours = duration.seconds // 3600
+    minutes = (duration.seconds % 3600) // 60
+    
+    await message.answer(
+        f"🛑 *Рассылка остановлена!*\n\n"
+        f"📊 *Итоговая статистика:*\n"
+        f"• 🕐 Длительность: {hours}ч {minutes}м\n"
+        f"• 📨 Отправлено: {user.campaign_stats.total_sent}\n"
+        f"• ❌ Ошибок: {user.campaign_stats.total_failed}\n"
+        f"• 📋 Чатов: {len(user.selected_chats)}\n\n"
+        f"🚀 *Для нового запуска используйте /launch*",
+        parse_mode='markdown'
+    )
+
+@dp.message_handler(commands=['status'])
+@dp.message_handler(lambda m: m.text == "📊 Статистика")
+async def show_stats(message: types.Message):
+    user_id = message.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    if not user.is_authenticated:
+        await message.answer("❌ Сначала подключите аккаунт", parse_mode='markdown')
+        return
+    
+    duration = user.campaign_stats.get_duration()
+    total_messages = user.campaign_stats.total_sent + user.campaign_stats.total_failed
+    
+    if total_messages > 0:
+        success_rate = (user.campaign_stats.total_sent / total_messages) * 100
+    else:
+        success_rate = 0
+    
+    stats_text = (
+        f"📊 *Ваша статистика:*\n\n"
+        f"👤 *Аккаунт:* {user.phone}\n"
+        f"📅 *Подключен:* {user.auth_date.strftime('%d.%m.%Y %H:%M') if user.auth_date else 'Неизвестно'}\n\n"
+        f"📨 *Рассылка:*\n"
+        f"• 🚀 Статус: {'🟢 АКТИВНА' if user.campaign_stats.is_active else '🔴 ОСТАНОВЛЕНА'}\n"
+        f"• 📨 Успешно: {user.campaign_stats.total_sent}\n"
+        f"• ❌ Ошибок: {user.campaign_stats.total_failed}\n"
+        f"• 📈 Успешность: {success_rate:.1f}%\n"
+        f"• 🕐 Длительность: {duration.days}д {duration.seconds//3600}ч {(duration.seconds%3600)//60}м\n\n"
+        f"📋 *Настройки:*\n"
+        f"• 📝 Сообщение: {'✅ Установлено' if user.message_text else '❌ Не установлено'}\n"
+        f"• 📋 Чатов выбрано: {len(user.selected_chats)}\n"
+        f"• 📂 Всего чатов в базе: {len(user.all_chats)}"
+    )
+    
+    if user.campaign_stats.is_active and user.campaign_stats.next_send_time:
+        time_left = user.campaign_stats.next_send_time - datetime.now()
+        if time_left.total_seconds() > 0:
+            mins_left = int(time_left.total_seconds() // 60)
+            secs_left = int(time_left.total_seconds() % 60)
+            stats_text += f"\n\n⏰ *Следующая отправка через:* {mins_left}м {secs_left}с"
+    
+    await message.answer(stats_text, parse_mode='markdown')
+
+@dp.message_handler(commands=['refresh'])
+@dp.message_handler(lambda m: m.text == "🔄 Обновить чаты")
+async def refresh_chats(message: types.Message):
+    user_id = message.from_user.id
+    user = data_manager.get_user(user_id)
+    
+    if not user.is_authenticated:
+        await message.answer("❌ Сначала подключите аккаунт", parse_mode='markdown')
+        return
+    
+    await message.answer("🔄 *Обновляю список чатов...*", parse_mode='markdown')
+    
+    chats = await get_user_chats(user_id)
+    if not chats:
+        await message.answer("❌ Не удалось обновить чаты", parse_mode='markdown')
+        return
+    
+    old_count = len(user.all_chats)
+    user.all_chats = chats
+    
+    # Сохраняем только те выбранные чаты, которые все еще существуют
+    existing_chat_ids = {str(chat.id) for chat in chats}
+    old_selected = len(user.selected_chats)
+    user.selected_chats = user.selected_chats.intersection(existing_chat_ids)
+    removed_count = old_selected - len(user.selected_chats)
+    
+    await data_manager.save_user(user)
+    
+    await message.answer(
+        f"✅ *Список чатов обновлен!*\n\n"
+        f"📊 *Статистика:*\n"
+        f"• Найдено чатов: {len(chats)}\n"
+        f"• Было: {old_count}\n"
+        f"• Изменение: {len(chats) - old_count:+}\n"
+        f"• Выбрано: {len(user.selected_chats)}\n"
+        f"• Удалено устаревших из выбора: {removed_count}",
+        parse_mode='markdown'
+    )
+
+@dp.message_handler(lambda m: m.text == "❌ Отмена")
+async def cancel_handler(message: types.Message, state: FSMContext):
+    await message.answer("❌ Действие отменено", reply_markup=get_main_keyboard())
+    await state.finish()
+
+@dp.message_handler(commands=['clear'])
+async def clear_data(message: types.Message):
+    """Очистка всех данных пользователя"""
+    user_id = message.from_user.id
+    
+    if user_id != Config.CREATOR_ID:
+        await message.answer("❌ Эта команда только для создателя бота")
+        return
+    
+    confirm_keyboard = InlineKeyboardMarkup()
+    confirm_keyboard.add(
+        InlineKeyboardButton("✅ Да, очистить все", callback_data="confirm_clear"),
+        InlineKeyboardButton("❌ Нет, отменить", callback_data="cancel_clear")
+    )
+    
+    await message.answer(
+        "⚠️ *Вы уверены что хотите очистить ВСЕ данные?*\n\n"
+        f"• Пользователей: {len(data_manager.users)}\n"
+        f"• Активных рассылок: {len(data_manager.active_tasks)}\n\n"
+        "*Это действие необратимо!*",
+        parse_mode='markdown',
+        reply_markup=confirm_keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data == 'confirm_clear')
+async def confirm_clear_data(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    
+    if user_id != Config.CREATOR_ID:
+        await callback_query.answer("❌ Доступ запрещен")
+        return
+    
+    # Останавливаем все задачи
+    for task_id, task in list(data_manager.active_tasks.items()):
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    
+    data_manager.active_tasks.clear()
+    data_manager.users.clear()
+    
+    # Удаляем файлы
+    try:
+        if Config.USERS_FILE.exists():
+            Config.USERS_FILE.unlink()
+        
+        # Удаляем сессии
+        for session_file in Config.SESSIONS_DIR.glob("session_*"):
+            session_file.unlink()
+    except Exception as e:
+        logger.error(f"Ошибка удаления файлов: {e}")
+    
+    await callback_query.message.edit_text(
+        "✅ *Все данные очищены!*\n\n"
+        "• Пользователи удалены\n"
+        "• Сессии удалены\n"
+        "• Рассылки остановлены",
+        parse_mode='markdown'
+    )
+    await callback_query.answer()
+
+@dp.callback_query_handler(lambda c: c.data == 'cancel_clear')
+async def cancel_clear_data(callback_query: types.CallbackQuery):
+    await callback_query.message.edit_text("❌ Очистка отменена")
+    await callback_query.answer()
+
+# ========== ЗАПУСК ==========
+async def on_startup(dp):
+    """Действия при запуске бота"""
+    logger.info("=" * 50)
+    logger.info(f"🚀 Запуск {Config.BOT_NAME} v4.0")
+    logger.info(f"👤 Создатель: {Config.CREATOR_ID}")
+    logger.info(f"🤖 Username: {Config.BOT_USERNAME}")
+    logger.info("=" * 50)
+    
+    # Восстанавливаем активные рассылки
+    restored_count = 0
+    for user_id, user in list(data_manager.users.items()):
+        if user.campaign_stats.is_active:
+            try:
+                await start_campaign_loop(user_id)
+                restored_count += 1
+                logger.info(f"Восстановлена рассылка для пользователя {user_id}")
+            except Exception as e:
+                logger.error(f"Ошибка восстановления рассылки {user_id}: {e}")
+                user.campaign_stats.stop()
+                await data_manager.save_user(user)
+    
+    logger.info(f"Восстановлено рассылок: {restored_count}")
+    
+    # Уведомление создателю
+    try:
+        await bot.send_message(
+            Config.CREATOR_ID,
+            f"🤖 *{Config.BOT_NAME} запущен!*\n\n"
+            f"🕐 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+            f"👥 Пользователей: {len(data_manager.users)}\n"
+            f"🔄 Восстановлено рассылок: {restored_count}\n"
+            f"📊 Активных задач: {len(data_manager.active_tasks)}",
+            parse_mode='markdown'
+        )
+    except Exception as e:
+        logger.error(f"Ошибка отправки уведомления создателю: {e}")
+
+async def on_shutdown(dp):
+    """Действия при выключении бота"""
+    logger.info("🛑 Остановка бота...")
+    
+    # Останавливаем все активные рассылки
+    for user_id, task in list(data_manager.active_tasks.items()):
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            
+            user = data_manager.get_user(user_id)
+            user.campaign_stats.stop()
+    
+    # Сохраняем данные
+    await data_manager.save_data_async()
+    logger.info("✅ Данные сохранены")
+    
+    try:
+        await bot.send_message(
+            Config.CREATOR_ID,
+            f"🛑 *{Config.BOT_NAME} остановлен!*\n\n"
+            f"🕐 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+            f"👥 Пользователей: {len(data_manager.users)}\n"
+            f"📊 Активных рассылок: {len(data_manager.active_tasks)}",
+            parse_mode='markdown'
+        )
+    except:
+        pass
+
+async def periodic_save():
+    """Периодическое сохранение данных"""
+    while True:
+        await asyncio.sleep(300)  # Сохраняем каждые 5 минут
+        try:
+            await data_manager.save_data_async()
+            logger.debug("Периодическое сохранение данных выполнено")
+        except Exception as e:
+            logger.error(f"Ошибка периодического сохранения: {e}")
+
+async def periodic_stats():
+    """Периодическая отправка статистики создателю"""
+    while True:
+        await asyncio.sleep(3600)  # Каждый час
+        try:
+            active_campaigns = sum(1 for user in data_manager.users.values() if user.campaign_stats.is_active)
+            total_sent = sum(user.campaign_stats.total_sent for user in data_manager.users.values())
+            total_failed = sum(user.campaign_stats.total_failed for user in data_manager.users.values())
+            total_users = len(data_manager.users)
+            
+            # Рассчитываем успешность
+            if total_sent + total_failed > 0:
+                success_rate = (total_sent / (total_sent + total_failed)) * 100
+            else:
+                success_rate = 0
+            
+            await bot.send_message(
+                Config.CREATOR_ID,
+                f"📊 *Ежечасная статистика {Config.BOT_NAME}*\n\n"
+                f"🕐 Время: {datetime.now().strftime('%H:%M:%S')}\n"
+                f"📅 Дата: {datetime.now().strftime('%d.%m.%Y')}\n\n"
+                f"👥 *Пользователи:*\n"
+                f"• Всего: {total_users}\n"
+                f"• Активных: {active_campaigns}\n\n"
+                f"📨 *Рассылки:*\n"
+                f"• Успешно: {total_sent:,}\n"
+                f"• Ошибок: {total_failed:,}\n"
+                f"• Успешность: {success_rate:.1f}%\n\n"
+                f"🤖 *Система:*\n"
+                f"• Активных задач: {len(data_manager.active_tasks)}\n"
+                f"• Запущен: {datetime.now().strftime('%d.%m.%Y')}",
+                parse_mode='markdown'
+            )
+        except Exception as e:
+            logger.error(f"Ошибка отправки статистики: {e}")
+
+async def monitor_active_campaigns():
+    """Мониторинг активных кампаний"""
+    while True:
+        await asyncio.sleep(60)  # Проверяем каждую минуту
+        
+        try:
+            current_time = datetime.now()
+            for user_id, user in list(data_manager.users.items()):
+                if user.campaign_stats.is_active:
+                    # Проверяем, не зависла ли задача
+                    if user_id in data_manager.active_tasks:
+                        task = data_manager.active_tasks[user_id]
+                        if task.done():
+                            # Задача завершена (ошибка или остановка)
+                            try:
+                                task.result()  # Проверяем исключения
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                            
+                            # Если задача завершилась, но рассылка должна быть активной, перезапускаем
+                            if user.campaign_stats.is_active:
+                                logger.warning(f"Перезапускаем зависшую рассылку для пользователя {user_id}")
+                                await start_campaign_loop(user_id)
+                    else:
+                        # Задачи нет, но рассылка активна - перезапускаем
+                        if user.campaign_stats.is_active:
+                            logger.warning(f"Восстанавливаем потерянную задачу для пользователя {user_id}")
+                            await start_campaign_loop(user_id)
+        except Exception as e:
+            logger.error(f"Ошибка в мониторинге кампаний: {e}")
+
+if __name__ == '__main__':
+    logger.info(f"🚀 Запуск {Config.BOT_NAME}...")
+    
+    # Запускаем фоновые задачи
+    loop = asyncio.get_event_loop()
+    loop.create_task(periodic_save())
+    loop.create_task(periodic_stats())
+    loop.create_task(monitor_active_campaigns())
+    
+    # Запуск бота
+    executor.start_polling(
+        dp,
+        skip_updates=True,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        timeout=60
+    )
